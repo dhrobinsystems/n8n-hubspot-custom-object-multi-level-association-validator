@@ -1,0 +1,1129 @@
+{
+  "name": "HubSpot Custom Object Multi-Level Association Validator",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Multi-Level Association Validator\n**Safe by default.** With no env vars set this workflow audits a SYNTHETIC Parent → Child → Asset fixture, changes nothing in HubSpot and sends nothing to Slack.\n\nHubSpot repairs need ALL of: `SANDBOX_MODE=false`, `DRY_RUN=false`, `HUBSPOT_MUTATIONS_ENABLED=true`, `HUBSPOT_ACCESS_TOKEN`, an action in `REMEDIATION_ACTIONS`, and a passing mutation guard (orphan-rate abort + `MAX_MUTATIONS_PER_RUN`).\n\nSlack needs `SEND_SLACK_ALERTS=true` + `DRY_RUN=false` + `SLACK_ALERT_WEBHOOK_URL`.\n\nSee README.md · DISCLAIMER.md",
+        "height": 320,
+        "width": 480,
+        "color": 4
+      },
+      "id": "66ede6f0-e8a1-4ee3-a1a9-22637409407d",
+      "name": "Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -400
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "a4233a38-c53f-44a8-a52d-6949936eaa90",
+      "name": "Weekly Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Every Sunday 02:00 UTC (workflow timezone = UTC)",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "1fdd0833-a651-4ef8-a12a-07be0d46de1a",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Config & Safety Gate\n// Reads every runtime setting from environment variables: the three custom\n// object types (Parent → Child → Asset), the association type IDs for each\n// direction, remediation options, thresholds and safety flags.\n// SAFE-BY-DEFAULT: a missing, blank or unrecognised flag resolves to its safe\n// value, so a fresh import performs zero HubSpot mutations and sends nothing.\n// Secret VALUES are never copied into the item: only \"is present\" booleans.\n// ─────────────────────────────────────────────────────────────────────────────\nlet envAccessible = true;\ntry { void $env.SANDBOX_MODE; } catch (e) { envAccessible = false; }\n\nconst readEnv = (key) => {\n  if (!envAccessible) return undefined;\n  try {\n    const v = $env[key];\n    return v === undefined || v === null ? undefined : String(v).trim();\n  } catch (e) {\n    return undefined;\n  }\n};\n\nconst warnings = [];\nif (!envAccessible) warnings.push('Environment access is blocked (N8N_BLOCK_ENV_ACCESS_IN_NODE=true). All safe defaults were applied.');\n\nconst flag = (key, safeDefault) => {\n  const raw = readEnv(key);\n  if (raw === undefined || raw === '') return safeDefault;\n  const v = raw.toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  warnings.push(`${key} has an unrecognised value; using safe default (${safeDefault}).`);\n  return safeDefault;\n};\nconst num = (key, def, min, max) => {\n  const raw = readEnv(key);\n  if (raw === undefined || raw === '') return def;\n  const n = Number(raw);\n  if (!Number.isFinite(n) || n < min || n > max) { warnings.push(`${key} must be a number between ${min} and ${max}; using default ${def}.`); return def; }\n  return n;\n};\nconst str = (key, def, pattern) => {\n  const raw = readEnv(key);\n  if (!raw) return def;\n  if (pattern && !pattern.test(raw)) { warnings.push(`${key} has an invalid format; using default.`); return def; }\n  return raw;\n};\nconst oneOf = (key, def, allowed) => {\n  const raw = (readEnv(key) || '').toLowerCase();\n  if (!raw) return def;\n  if (allowed.includes(raw)) return raw;\n  warnings.push(`${key} must be one of ${allowed.join(', ')}; using default ${def}.`);\n  return def;\n};\n\n// ── Run clock\nlet runDate = new Date();\nconst tsOverride = readEnv('RUN_TIMESTAMP_OVERRIDE');\nif (tsOverride) {\n  const d = new Date(tsOverride);\n  if (Number.isNaN(d.getTime())) warnings.push('RUN_TIMESTAMP_OVERRIDE is not a valid ISO date; using current time.');\n  else runDate = d;\n}\n\n// ── Safety flags (safe defaults)\nconst sandboxRequested = flag('SANDBOX_MODE', true);\nconst dryRun = flag('DRY_RUN', true);\nconst hubspotMutationsEnabled = flag('HUBSPOT_MUTATIONS_ENABLED', false);\nconst sendSlackAlerts = flag('SEND_SLACK_ALERTS', false);\nconst sendOpsAlerts = flag('SEND_OPS_ALERTS', false);\n\n// ── Secret presence only\nconst hasHubspotToken = Boolean(readEnv('HUBSPOT_ACCESS_TOKEN'));\nconst hasSlackWebhook = /^https:\\/\\//i.test(readEnv('SLACK_ALERT_WEBHOOK_URL') || '');\nconst hasAlertWebhook = /^https:\\/\\//i.test(readEnv('ALERT_WEBHOOK_URL') || '');\n\n// ── Hierarchy definition (placeholders by default)\nconst TYPE_RE = /^(p\\d+_[a-z0-9_]+|2-\\d+)$/;\nconst TYPE_ID_RE = /^2-\\d+$/;\nconst PROP_RE = /^[a-z][a-z0-9_]{0,99}$/;\nconst nameProperty = str('RECORD_NAME_PROPERTY', 'name', PROP_RE);\nconst keyProperty = str('RECORD_KEY_PROPERTY', 'external_id', PROP_RE);\nconst levels = {\n  parent: {\n    key: 'parent', label: str('PARENT_LABEL', 'Parent'),\n    objectType: str('HUBSPOT_PARENT_OBJECT_TYPE', 'p99000001_parent_account', TYPE_RE),\n    objectTypeId: str('HUBSPOT_PARENT_OBJECT_TYPE_ID', '2-99000101', TYPE_ID_RE),\n    hintProperty: null,\n  },\n  child: {\n    key: 'child', label: str('CHILD_LABEL', 'Child'),\n    objectType: str('HUBSPOT_CHILD_OBJECT_TYPE', 'p99000001_child_project', TYPE_RE),\n    objectTypeId: str('HUBSPOT_CHILD_OBJECT_TYPE_ID', '2-99000102', TYPE_ID_RE),\n    hintProperty: str('CHILD_PARENT_HINT_PROPERTY', 'parent_external_id', PROP_RE),\n  },\n  asset: {\n    key: 'asset', label: str('ASSET_LABEL', 'Asset'),\n    objectType: str('HUBSPOT_ASSET_OBJECT_TYPE', 'p99000001_asset_unit', TYPE_RE),\n    objectTypeId: str('HUBSPOT_ASSET_OBJECT_TYPE_ID', '2-99000103', TYPE_ID_RE),\n    hintProperty: str('ASSET_CHILD_HINT_PROPERTY', 'child_external_id', PROP_RE),\n  },\n};\nconst distinctTypes = new Set(Object.values(levels).map((l) => l.objectType));\nif (distinctTypes.size !== 3) warnings.push('Parent, Child and Asset object types must be three distinct object types.');\n\n// Association definitions: \"up\" = lower → upper, \"down\" = upper → lower.\nconst relations = [\n  {\n    key: 'parent_child', upper: 'parent', lower: 'child',\n    upTypeId: Math.floor(num('PARENT_CHILD_UP_TYPE_ID', 901, 1, 1e9)),\n    downTypeId: Math.floor(num('PARENT_CHILD_DOWN_TYPE_ID', 902, 1, 1e9)),\n    maxUpperPerLower: Math.floor(num('MAX_PARENTS_PER_CHILD', 1, 1, 1000)),\n    requireUpper: flag('REQUIRE_PARENT_FOR_CHILD', true),\n    upDirection: 'child_to_parent', downDirection: 'parent_to_child',\n  },\n  {\n    key: 'child_asset', upper: 'child', lower: 'asset',\n    upTypeId: Math.floor(num('CHILD_ASSET_UP_TYPE_ID', 903, 1, 1e9)),\n    downTypeId: Math.floor(num('CHILD_ASSET_DOWN_TYPE_ID', 904, 1, 1e9)),\n    maxUpperPerLower: Math.floor(num('MAX_CHILDREN_PER_ASSET', 1, 1, 1000)),\n    requireUpper: flag('REQUIRE_CHILD_FOR_ASSET', true),\n    upDirection: 'asset_to_child', downDirection: 'child_to_asset',\n  },\n];\n\n// ── Remediation options (mutations still require every gate below)\nconst ACTIONS = ['create_missing_association', 'archive_dangling_association', 'flag_records'];\nconst remediationActions = (readEnv('REMEDIATION_ACTIONS') || 'flag_records')\n  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\nconst unknownActions = remediationActions.filter((a) => !ACTIONS.includes(a));\nif (unknownActions.length) warnings.push(`REMEDIATION_ACTIONS contains unknown action(s) ignored: ${unknownActions.join(', ')}.`);\nconst enabledActions = ACTIONS.filter((a) => remediationActions.includes(a));\n\n// ── Live readiness and hard gates\nlet sandboxMode = sandboxRequested;\nif (!sandboxRequested && !hasHubspotToken) {\n  sandboxMode = true;\n  warnings.push('SANDBOX_MODE=false but HUBSPOT_ACCESS_TOKEN is missing. Forced back to sandbox fixtures.');\n}\nif (!sandboxRequested && distinctTypes.size !== 3) {\n  sandboxMode = true;\n  warnings.push('Live mode refused: object types are not distinct. Forced back to sandbox fixtures.');\n}\n\nconst allowHubspotMutations = !sandboxMode && !dryRun && hubspotMutationsEnabled && hasHubspotToken && enabledActions.length > 0;\nconst allowSlackSend = sendSlackAlerts && !dryRun && hasSlackWebhook;\nconst allowOpsAlert = sendOpsAlerts && !dryRun && hasAlertWebhook;\nconst mutationBlockedReason = allowHubspotMutations ? null\n  : sandboxMode ? 'sandbox_mode'\n  : dryRun ? 'dry_run'\n  : !hubspotMutationsEnabled ? 'hubspot_mutations_disabled'\n  : !hasHubspotToken ? 'missing_hubspot_token'\n  : 'no_remediation_actions_enabled';\n\n// ── Live search bodies (paginated via the HTTP node's \"after\" body parameter)\nconst searchBody = (lvl) => ({\n  filterGroups: [],\n  properties: [...new Set([nameProperty, keyProperty, 'integrity_status', 'hs_lastmodifieddate', lvl.hintProperty].filter(Boolean))],\n  sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }],\n  limit: 100,\n});\n\nconst modeLabel = sandboxMode ? 'SANDBOX' : (dryRun ? 'LIVE-DRY-RUN' : 'LIVE');\nconst stamp = runDate.toISOString().replace(/[-:]/g, '').replace(/\\..+$/, '').replace('T', '-');\nconst execId = (typeof $execution !== 'undefined' && $execution && $execution.id) ? String($execution.id) : 'manual';\n\nreturn [{\n  json: {\n    runId: `cmav-${stamp}-${execId}`,\n    runStartedAt: runDate.toISOString(),\n    runDate: runDate.toISOString().slice(0, 10),\n    modeLabel,\n    envAccessible,\n\n    sandboxRequested,\n    sandboxMode,\n    dryRun,\n    hubspotMutationsEnabled,\n    sendSlackAlerts,\n    sendOpsAlerts,\n    allowHubspotMutations,\n    allowSlackSend,\n    allowOpsAlert,\n    mutationBlockedReason,\n    secretsPresent: { hasHubspotToken, hasSlackWebhook, hasAlertWebhook },\n\n    hubspotPortalId: str('HUBSPOT_PORTAL_ID', '99000001', /^\\d{1,12}$/),\n    hubspotAppBaseUrl: str('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com', /^https:\\/\\/app(-[a-z0-9]+)?\\.hubspot\\.com$/),\n    nameProperty,\n    keyProperty,\n    levels,\n    relations,\n    searchBodies: { parent: searchBody(levels.parent), child: searchBody(levels.child), asset: searchBody(levels.asset) },\n    searchMaxPages: Math.floor(num('SEARCH_MAX_PAGES', 100, 1, 100)),\n    associationBatchSize: Math.floor(num('ASSOCIATION_BATCH_SIZE', 100, 1, 1000)),\n    mutationBatchSize: Math.floor(num('MUTATION_BATCH_SIZE', 100, 1, 100)),\n\n    associationCategory: oneOf('ASSOCIATION_CATEGORY', 'user_defined', ['user_defined', 'hubspot_defined']).toUpperCase(),\n    strictAssociationTypes: flag('STRICT_ASSOCIATION_TYPES', true),\n    checkBidirectional: flag('CHECK_BIDIRECTIONAL_ASSOCIATIONS', true),\n    flagEmptyParents: flag('FLAG_EMPTY_PARENTS', true),\n\n    enabledActions,\n    maxMutationsPerRun: Math.floor(num('MAX_MUTATIONS_PER_RUN', 100, 0, 10000)),\n    mutationAbortOrphanRatePct: num('MUTATION_ABORT_ORPHAN_RATE_PCT', 50, 1, 100),\n    orphanRateAlertThresholdPct: num('ORPHAN_RATE_ALERT_THRESHOLD_PCT', 5, 0, 100),\n    alertMinSeverity: oneOf('ALERT_MIN_SEVERITY', 'medium', ['low', 'medium', 'high', 'critical']),\n\n    warnings,\n  },\n}];\n"
+      },
+      "id": "18c82b40-9f62-43d0-af8b-49440be5e8f9",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0e6d8407-19c0-4593-a28f-e9cc235e5440",
+              "leftValue": "={{ $json.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "da7e5501-f868-4b7b-aba2-cf52ef6f79fc",
+      "name": "Route: Sandbox or Live?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Load Sandbox Fixture\n// Emits the SYNTHETIC association graph (mirrors\n// sample-payloads/hubspot-association-hierarchy-fixture.json). Record shapes\n// mimic CRM v3 search results; association shapes mimic CRM v4 batch/read.\n// No network calls.\n// ─────────────────────────────────────────────────────────────────────────────\n/* FIXTURE:START */\nconst FIXTURE = {\n  \"_meta\": {\n    \"description\": \"SYNTHETIC sandbox fixture for n8n-hubspot-custom-object-multi-level-association-validator. Every record, ID, portal, object type and association type is fictional. Record shapes mirror HubSpot CRM v3 search results; association shapes mirror CRM v4 batch/read results.\",\n    \"schemaVersion\": \"association-hierarchy-graph/v1\",\n    \"hubspotPortalId\": \"99000001\",\n    \"expectedFindings\": {\n      \"orphan_child\": [\n        \"ChildProject C (repairable via parent_external_id PAR-002)\",\n        \"ChildProject D (no hint, manual review)\",\n        \"ChildProject G (hint PAR-404 matches no parent)\",\n        \"ChildProject H (only link points to deleted parent)\"\n      ],\n      \"orphan_asset\": [\n        \"AssetUnit Z (repairable via child_external_id CHD-001)\",\n        \"AssetUnit W (only link points to deleted child)\"\n      ],\n      \"dangling_association\": [\n        \"ChildProject H → deleted parent 9100999\",\n        \"ParentHoldings Ltd → deleted child 9200998\",\n        \"AssetUnit W → deleted child 9200999\"\n      ],\n      \"multiple_parents\": [\n        \"ChildProject E (ParentCorp Inc + ParentHoldings Ltd)\"\n      ],\n      \"association_label_mismatch\": [\n        \"ChildProject F → ParentHoldings Ltd uses typeId 999 instead of 901\"\n      ],\n      \"broken_chain\": [\n        \"AssetUnit V (its child ChildProject D has no parent)\"\n      ],\n      \"asymmetric_association\": [\n        \"AssetUnit U ↔ ChildProject B present only in the asset → child read\"\n      ],\n      \"empty_parent\": [\n        \"EmptyShell Group has no children\"\n      ],\n      \"stale_flag_cleared\": [\n        \"AssetUnit T was flagged orphaned last run and is now healthy\"\n      ]\n    }\n  },\n  \"graph\": {\n    \"source\": \"sandbox\",\n    \"levels\": {\n      \"parent\": {\n        \"objectType\": \"p99000001_parent_account\",\n        \"objectTypeId\": \"2-99000101\",\n        \"label\": \"Parent\"\n      },\n      \"child\": {\n        \"objectType\": \"p99000001_child_project\",\n        \"objectTypeId\": \"2-99000102\",\n        \"label\": \"Child\"\n      },\n      \"asset\": {\n        \"objectType\": \"p99000001_asset_unit\",\n        \"objectTypeId\": \"2-99000103\",\n        \"label\": \"Asset\"\n      }\n    },\n    \"schemas\": {\n      \"parent\": {\n        \"objectTypeId\": \"2-99000101\",\n        \"fullyQualifiedName\": \"p99000001_parent_account\",\n        \"associations\": [\n          {\n            \"id\": \"902\",\n            \"fromObjectTypeId\": \"2-99000101\",\n            \"toObjectTypeId\": \"2-99000102\",\n            \"name\": \"parent_account_to_child_project\"\n          }\n        ]\n      },\n      \"child\": {\n        \"objectTypeId\": \"2-99000102\",\n        \"fullyQualifiedName\": \"p99000001_child_project\",\n        \"associations\": [\n          {\n            \"id\": \"901\",\n            \"fromObjectTypeId\": \"2-99000102\",\n            \"toObjectTypeId\": \"2-99000101\",\n            \"name\": \"child_project_to_parent_account\"\n          },\n          {\n            \"id\": \"904\",\n            \"fromObjectTypeId\": \"2-99000102\",\n            \"toObjectTypeId\": \"2-99000103\",\n            \"name\": \"child_project_to_asset_unit\"\n          }\n        ]\n      },\n      \"asset\": {\n        \"objectTypeId\": \"2-99000103\",\n        \"fullyQualifiedName\": \"p99000001_asset_unit\",\n        \"associations\": [\n          {\n            \"id\": \"903\",\n            \"fromObjectTypeId\": \"2-99000103\",\n            \"toObjectTypeId\": \"2-99000102\",\n            \"name\": \"asset_unit_to_child_project\"\n          }\n        ]\n      }\n    },\n    \"records\": {\n      \"parent\": [\n        {\n          \"id\": \"9100001\",\n          \"properties\": {\n            \"hs_object_id\": \"9100001\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ParentCorp Inc\",\n            \"external_id\": \"PAR-001\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9100002\",\n          \"properties\": {\n            \"hs_object_id\": \"9100002\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ParentHoldings Ltd\",\n            \"external_id\": \"PAR-002\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9100003\",\n          \"properties\": {\n            \"hs_object_id\": \"9100003\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"EmptyShell Group\",\n            \"external_id\": \"PAR-003\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        }\n      ],\n      \"child\": [\n        {\n          \"id\": \"9200001\",\n          \"properties\": {\n            \"hs_object_id\": \"9200001\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject A\",\n            \"external_id\": \"CHD-001\",\n            \"parent_external_id\": \"PAR-001\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200002\",\n          \"properties\": {\n            \"hs_object_id\": \"9200002\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject B\",\n            \"external_id\": \"CHD-002\",\n            \"parent_external_id\": \"PAR-001\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200003\",\n          \"properties\": {\n            \"hs_object_id\": \"9200003\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject C\",\n            \"external_id\": \"CHD-003\",\n            \"parent_external_id\": \"PAR-002\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200004\",\n          \"properties\": {\n            \"hs_object_id\": \"9200004\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject D\",\n            \"external_id\": \"CHD-004\",\n            \"parent_external_id\": null,\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200005\",\n          \"properties\": {\n            \"hs_object_id\": \"9200005\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject E\",\n            \"external_id\": \"CHD-005\",\n            \"parent_external_id\": \"PAR-001\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200006\",\n          \"properties\": {\n            \"hs_object_id\": \"9200006\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject F\",\n            \"external_id\": \"CHD-006\",\n            \"parent_external_id\": \"PAR-002\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200007\",\n          \"properties\": {\n            \"hs_object_id\": \"9200007\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject G\",\n            \"external_id\": \"CHD-007\",\n            \"parent_external_id\": \"PAR-404\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9200008\",\n          \"properties\": {\n            \"hs_object_id\": \"9200008\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"ChildProject H\",\n            \"external_id\": \"CHD-008\",\n            \"parent_external_id\": null,\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        }\n      ],\n      \"asset\": [\n        {\n          \"id\": \"9300001\",\n          \"properties\": {\n            \"hs_object_id\": \"9300001\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit X\",\n            \"external_id\": \"AST-001\",\n            \"child_external_id\": \"CHD-001\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300002\",\n          \"properties\": {\n            \"hs_object_id\": \"9300002\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit Y\",\n            \"external_id\": \"AST-002\",\n            \"child_external_id\": \"CHD-002\",\n            \"integrity_status\": \"ok\"\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300003\",\n          \"properties\": {\n            \"hs_object_id\": \"9300003\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit Z\",\n            \"external_id\": \"AST-003\",\n            \"child_external_id\": \"CHD-001\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300004\",\n          \"properties\": {\n            \"hs_object_id\": \"9300004\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit W\",\n            \"external_id\": \"AST-004\",\n            \"child_external_id\": null,\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300005\",\n          \"properties\": {\n            \"hs_object_id\": \"9300005\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit V\",\n            \"external_id\": \"AST-005\",\n            \"child_external_id\": \"CHD-004\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300006\",\n          \"properties\": {\n            \"hs_object_id\": \"9300006\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit U\",\n            \"external_id\": \"AST-006\",\n            \"child_external_id\": \"CHD-002\",\n            \"integrity_status\": null\n          },\n          \"archived\": false\n        },\n        {\n          \"id\": \"9300007\",\n          \"properties\": {\n            \"hs_object_id\": \"9300007\",\n            \"hs_lastmodifieddate\": \"2026-11-14T10:00:00.000Z\",\n            \"name\": \"AssetUnit T\",\n            \"external_id\": \"AST-007\",\n            \"child_external_id\": \"CHD-001\",\n            \"integrity_status\": \"orphaned\"\n          },\n          \"archived\": false\n        }\n      ]\n    },\n    \"associations\": {\n      \"child_to_parent\": {\n        \"status\": \"COMPLETE\",\n        \"results\": [\n          {\n            \"from\": {\n              \"id\": \"9200001\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9100001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 901,\n                    \"label\": \"Child of parent\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200002\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9100001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 901,\n                    \"label\": \"Child of parent\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200005\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9100001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 901,\n                    \"label\": \"Child of parent\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9100002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 901,\n                    \"label\": \"Child of parent\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200006\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9100002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 999,\n                    \"label\": null\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200008\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9100999,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 901,\n                    \"label\": \"Child of parent\"\n                  }\n                ]\n              }\n            ]\n          }\n        ]\n      },\n      \"parent_to_child\": {\n        \"status\": \"COMPLETE\",\n        \"results\": [\n          {\n            \"from\": {\n              \"id\": \"9100001\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9200002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9200005,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9100002\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200005,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9200006,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9200998,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 902,\n                    \"label\": \"Parent of child\"\n                  }\n                ]\n              }\n            ]\n          }\n        ]\n      },\n      \"asset_to_child\": {\n        \"status\": \"COMPLETE\",\n        \"results\": [\n          {\n            \"from\": {\n              \"id\": \"9300001\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9300002\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9300004\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200999,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9300005\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200004,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9300006\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9300007\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9200001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 903,\n                    \"label\": \"Asset of child\"\n                  }\n                ]\n              }\n            ]\n          }\n        ]\n      },\n      \"child_to_asset\": {\n        \"status\": \"COMPLETE\",\n        \"results\": [\n          {\n            \"from\": {\n              \"id\": \"9200001\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9300001,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 904,\n                    \"label\": \"Child of asset\"\n                  }\n                ]\n              },\n              {\n                \"toObjectId\": 9300007,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 904,\n                    \"label\": \"Child of asset\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200002\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9300002,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 904,\n                    \"label\": \"Child of asset\"\n                  }\n                ]\n              }\n            ]\n          },\n          {\n            \"from\": {\n              \"id\": \"9200004\"\n            },\n            \"to\": [\n              {\n                \"toObjectId\": 9300005,\n                \"associationTypes\": [\n                  {\n                    \"category\": \"USER_DEFINED\",\n                    \"typeId\": 904,\n                    \"label\": \"Child of asset\"\n                  }\n                ]\n              }\n            ]\n          }\n        ]\n      }\n    },\n    \"fetchMeta\": {\n      \"truncated\": {\n        \"parent\": false,\n        \"child\": false,\n        \"asset\": false\n      },\n      \"pages\": {\n        \"parent\": 1,\n        \"child\": 1,\n        \"asset\": 1\n      },\n      \"errors\": []\n    }\n  }\n};\n/* FIXTURE:END */\n\nif (!FIXTURE || !FIXTURE.graph || !FIXTURE.graph.records || !FIXTURE.graph.associations) {\n  throw new Error('Sandbox fixture must contain graph.records and graph.associations.');\n}\nreturn [{ json: { ...FIXTURE.graph, source: 'sandbox' }, pairedItem: { item: 0 } }];\n"
+      },
+      "id": "86d7274e-7776-43ce-a658-f09fa969fdcb",
+      "name": "Load Sandbox Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Build Live Fetch Plan\n// One item per hierarchy level. Drives the read-only schema preflight\n// (GET /crm/v3/schemas/{objectType}, scope crm.schemas.custom.read), which\n// confirms the configured association type IDs exist before anything is\n// trusted or repaired.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nreturn ['parent', 'child', 'asset'].map((levelKey) => ({\n  json: { levelKey, objectType: cfg.levels[levelKey].objectType },\n  pairedItem: { item: 0 },\n}));\n"
+      },
+      "id": "6ff79cb0-f9d4-4950-a0d0-0d5faf7e3442",
+      "name": "Build Live Fetch Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.hubapi.com/crm/v3/schemas/{{ $json.objectType }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          }
+        }
+      },
+      "id": "7879b6a2-180d-4997-a8ee-5d590a4ae3ea",
+      "name": "HubSpot: Read Schema Definitions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        260
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Read-only preflight (crm.schemas.custom.read).",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hubapi.com/crm/v3/objects/{{ $('Config & Safety Gate').first().json.levels.parent.objectType }}/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config & Safety Gate').first().json.searchBodies.parent) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          },
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging.next.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.searchMaxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "159bef90-8f80-4838-a6eb-08352f97a0f3",
+      "name": "HubSpot: Search Parent Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        260
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Paginated read (crm.objects.custom.read). Execute once.",
+      "notesInFlow": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hubapi.com/crm/v3/objects/{{ $('Config & Safety Gate').first().json.levels.child.objectType }}/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config & Safety Gate').first().json.searchBodies.child) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          },
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging.next.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.searchMaxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "9dc1908c-921f-4109-aa8a-19c4784fabab",
+      "name": "HubSpot: Search Child Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        260
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Paginated read. Execute once.",
+      "notesInFlow": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hubapi.com/crm/v3/objects/{{ $('Config & Safety Gate').first().json.levels.asset.objectType }}/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config & Safety Gate').first().json.searchBodies.asset) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          },
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging.next.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": "={{ $('Config & Safety Gate').first().json.searchMaxPages }}",
+              "requestInterval": 250
+            }
+          }
+        }
+      },
+      "id": "29e7b8d6-a809-4c98-ad8c-60101410da3a",
+      "name": "HubSpot: Search Asset Records",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        260
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Paginated read. Execute once.",
+      "notesInFlow": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Build Association Read Batches\n// Collects the paginated search results for all three levels and builds\n// CRM v4 association batch/read requests for every direction:\n//   child → parent, parent → child, asset → child, child → asset\n// Reading both directions lets the engine detect asymmetric links.\n// If there is nothing to read, emits a single { noReads: true } marker.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst SEARCH_NODES = { parent: 'HubSpot: Search Parent Records', child: 'HubSpot: Search Child Records', asset: 'HubSpot: Search Asset Records' };\n\nconst idsFor = (levelKey) => {\n  const ids = [];\n  for (const page of $(SEARCH_NODES[levelKey]).all()) {\n    const body = page.json || {};\n    if (body.error || !Array.isArray(body.results)) continue;\n    for (const r of body.results) if (r && r.id) ids.push(String(r.id));\n  }\n  return [...new Set(ids)];\n};\nconst ids = { parent: idsFor('parent'), child: idsFor('child'), asset: idsFor('asset') };\n\nconst directions = [];\nfor (const rel of cfg.relations) {\n  directions.push({ direction: rel.upDirection, fromLevel: rel.lower, toLevel: rel.upper });\n  if (cfg.checkBidirectional) directions.push({ direction: rel.downDirection, fromLevel: rel.upper, toLevel: rel.lower });\n}\n\nconst size = cfg.associationBatchSize;\nconst out = [];\nfor (const d of directions) {\n  const fromType = cfg.levels[d.fromLevel].objectType;\n  const toType = cfg.levels[d.toLevel].objectType;\n  const list = ids[d.fromLevel];\n  for (let i = 0; i < list.length; i += size) {\n    out.push({\n      json: {\n        noReads: false,\n        direction: d.direction,\n        fromLevel: d.fromLevel,\n        toLevel: d.toLevel,\n        path: `/crm/v4/associations/${fromType}/${toType}/batch/read`,\n        body: { inputs: list.slice(i, i + size).map((id) => ({ id })) },\n      },\n      pairedItem: { item: 0 },\n    });\n  }\n}\n\nif (out.length === 0) return [{ json: { noReads: true, direction: null, recordCounts: { parent: ids.parent.length, child: ids.child.length, asset: ids.asset.length } } }];\nreturn out;\n"
+      },
+      "id": "1870b040-337b-4c16-aece-434a9512ed75",
+      "name": "Build Association Read Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7ca58fd6-c70e-4bf6-a7a2-16e71af1f785",
+              "leftValue": "={{ !$json.noReads }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b25bc1e0-fbdf-4ecc-ade2-17dae9fe7d45",
+      "name": "Gate: Any Association Reads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2040,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hubapi.com{{ $json.path }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          }
+        }
+      },
+      "id": "5a4614d2-bf16-4f99-aaed-790f85857222",
+      "name": "HubSpot: Batch Read Associations (v4)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2260,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Read-only v4 batch/read for every direction.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Assemble Live Association Graph\n// Rebuilds the exact graph shape the sandbox fixture uses:\n//   { levels, schemas, records{parent,child,asset}, associations{direction:{results}}, fetchMeta }\n// Responses are paired with their requests by index. Any fetch error or a\n// truncated search is recorded in fetchMeta so the engine can refuse to\n// trust \"dangling\" verdicts or to mutate anything.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst SEARCH_NODES = { parent: 'HubSpot: Search Parent Records', child: 'HubSpot: Search Child Records', asset: 'HubSpot: Search Asset Records' };\nconst errText = (e) => (typeof e === 'string' ? e : (e && (e.message || e.description)) || 'request failed').toString().slice(0, 300);\n\nconst fetchMeta = { truncated: {}, pages: {}, errors: [] };\nconst records = {};\nfor (const [levelKey, nodeName] of Object.entries(SEARCH_NODES)) {\n  const pages = $(nodeName).all().map((p) => p.json || {});\n  const seen = new Map();\n  let truncated = false;\n  pages.forEach((body, i) => {\n    if (body.error) { fetchMeta.errors.push({ stage: `search_${levelKey}`, message: errText(body.error) }); return; }\n    for (const r of body.results || []) if (r && r.id) seen.set(String(r.id), { id: String(r.id), properties: r.properties || {}, archived: Boolean(r.archived) });\n    if (i === pages.length - 1 && body.paging && body.paging.next && body.paging.next.after) truncated = true;\n  });\n  const total = pages.reduce((m, b) => Math.max(m, Number(b.total) || 0), 0);\n  if (total > seen.size) truncated = true;\n  records[levelKey] = [...seen.values()];\n  fetchMeta.truncated[levelKey] = truncated;\n  fetchMeta.pages[levelKey] = pages.length;\n}\n\n// Schema preflight responses (paired with Build Live Fetch Plan by index)\nconst schemas = {};\nconst plan = $('Build Live Fetch Plan').all();\n$('HubSpot: Read Schema Definitions').all().forEach((r, i) => {\n  const levelKey = plan[i] ? plan[i].json.levelKey : null;\n  if (!levelKey) return;\n  const body = r.json || {};\n  if (body.error) { fetchMeta.errors.push({ stage: `schema_${levelKey}`, message: errText(body.error), nonBlocking: true }); schemas[levelKey] = null; return; }\n  schemas[levelKey] = { objectTypeId: body.objectTypeId || body.id || null, fullyQualifiedName: body.fullyQualifiedName || null, associations: Array.isArray(body.associations) ? body.associations : [] };\n});\n\n// Association reads\nconst associations = {};\nconst first = $input.first().json || {};\nif (!first.noReads) {\n  const requests = $('Build Association Read Batches').all();\n  const responses = $input.all();\n  if (responses.length !== requests.length) throw new Error(`Association response count (${responses.length}) does not match request count (${requests.length}).`);\n  responses.forEach((r, i) => {\n    const req = requests[i].json;\n    const body = r.json || {};\n    const bucket = associations[req.direction] || (associations[req.direction] = { status: 'COMPLETE', results: [] });\n    if (body.error) {\n      bucket.status = 'ERROR';\n      fetchMeta.errors.push({ stage: `associations_${req.direction}`, message: errText(body.error) });\n      return;\n    }\n    for (const row of body.results || []) {\n      bucket.results.push(row);\n      if (row.paging && row.paging.next) fetchMeta.errors.push({ stage: `associations_${req.direction}`, message: `Record ${row.from && row.from.id} has more than one page of associations; only the first page was read.`, nonBlocking: true });\n    }\n    // HubSpot reports records with zero associations under errors (e.g. NO_ASSOCIATIONS_FOUND) — that is data, not failure.\n  });\n}\n\nreturn [{\n  json: {\n    source: 'live',\n    levels: Object.fromEntries(Object.entries(cfg.levels).map(([k, l]) => [k, { objectType: l.objectType, objectTypeId: l.objectTypeId, label: l.label }])),\n    schemas,\n    records,\n    associations,\n    fetchMeta,\n  },\n}];\n"
+      },
+      "id": "29d2fc60-6c71-46a8-ae18-f81a23a8ac5b",
+      "name": "Assemble Live Association Graph",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Association Integrity & Orphan Detection Engine  (Run Once for All Items)\n// Input: one association graph (sandbox fixture or live HubSpot reads).\n// 1. Indexes Parent, Child and Asset records and both read directions of\n//    each relation (child↔parent, asset↔child).\n// 2. Detects:\n//    • orphan_child / orphan_asset      – no valid link to the level above\n//    • dangling_association             – link points to a deleted/archived ID\n//    • broken_chain                     – asset whose only children are orphans\n//    • cardinality_violation            – more parents/children than allowed\n//    • association_label_mismatch       – link exists without the expected type ID\n//    • asymmetric_association           – seen in one read direction only\n//    • empty_parent                     – parent with no children (informational)\n//    • association_definition_missing   – configured type ID absent from schema\n//    • audit_incomplete                 – a direction could not be read\n// 3. Plans remediation: create missing associations (only from an exact,\n//    unique hint-property match), archive verified dangling links, and flag\n//    records with integrity_status — all subject to the mutation guard.\n// Pure JavaScript: no network, no require(), runs identically in the simulator.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst g = $input.first().json || {};\nconst LEVELS = ['parent', 'child', 'asset'];\nconst SEVERITIES = ['low', 'medium', 'high', 'critical'];\nconst sevRank = (s) => SEVERITIES.indexOf(s);\nconst maxSev = (a, b) => (sevRank(a) >= sevRank(b) ? a : b);\nconst fetchMeta = g.fetchMeta || { truncated: {}, pages: {}, errors: [] };\nconst blockingFetchErrors = (fetchMeta.errors || []).filter((e) => !e.nonBlocking);\n\n// ── Index records ───────────────────────────────────────────────────────────\nconst objectTypeIdOf = (lvl) => (g.levels && g.levels[lvl] && g.levels[lvl].objectTypeId) || cfg.levels[lvl].objectTypeId;\nconst recordUrl = (lvl, id) => `${cfg.hubspotAppBaseUrl}/contacts/${cfg.hubspotPortalId}/record/${objectTypeIdOf(lvl)}/${id}`;\nconst byId = {};\nfor (const lvl of LEVELS) {\n  byId[lvl] = new Map();\n  for (const r of (g.records && g.records[lvl]) || []) {\n    if (!r || r.id === undefined || r.id === null || r.archived) continue;\n    const p = r.properties || {};\n    const hintProp = cfg.levels[lvl].hintProperty;\n    const clean = (v) => (v === null || v === undefined || String(v).trim() === '' ? null : String(v).trim());\n    byId[lvl].set(String(r.id), {\n      id: String(r.id), level: lvl,\n      name: clean(p[cfg.nameProperty]) || `${cfg.levels[lvl].label} ${r.id}`,\n      key: clean(p[cfg.keyProperty]),\n      hint: hintProp ? clean(p[hintProp]) : null,\n      priorStatus: clean(p.integrity_status),\n    });\n  }\n}\nconst keyIndex = {};\nfor (const lvl of LEVELS) {\n  keyIndex[lvl] = new Map();\n  for (const r of byId[lvl].values()) if (r.key) { const k = r.key.toLowerCase(); keyIndex[lvl].set(k, [...(keyIndex[lvl].get(k) || []), r]); }\n}\n\n// ── Parse association reads (CRM v4 batch/read shape) ────────────────────────\nconst parseDirection = (dir) => {\n  const bucket = g.associations ? g.associations[dir] : undefined;\n  const map = new Map();\n  if (!bucket || bucket.status === 'ERROR') return { read: false, map };\n  for (const row of bucket.results || []) {\n    const fromId = row && row.from && row.from.id !== undefined ? String(row.from.id) : null;\n    if (!fromId) continue;\n    const list = map.get(fromId) || [];\n    for (const t of row.to || []) {\n      const types = (t.associationTypes || []).map((a) => Number(a.typeId)).filter(Number.isFinite);\n      list.push({ toId: String(t.toObjectId), types });\n    }\n    map.set(fromId, list);\n  }\n  return { read: true, map };\n};\n\n// ── Issue collection ─────────────────────────────────────────────────────────\nconst issues = [];\nconst issueKeys = new Set();\nconst addIssue = (i) => {\n  const id = `${i.code}:${i.recordId || '-'}:${i.relatedId || '-'}`;\n  if (issueKeys.has(id)) return;\n  issueKeys.add(id);\n  issues.push({ id, ...i });\n};\nconst recIssues = new Map(); // `${level}:${id}` -> Set(codes)\nconst tagRecord = (lvl, id, code) => { const k = `${lvl}:${id}`; recIssues.set(k, (recIssues.get(k) || new Set()).add(code)); };\n\nconst creates = [];   // { fromLevel, toLevel, typeId, fromId, toId, reason }\nconst archives = [];  // { fromLevel, toLevel, fromId, toId }\nconst orphanSet = { child: new Set(), asset: new Set() };\nconst validUppers = { child: new Map(), asset: new Map() }; // lowerId -> Set(upperIds)\nconst auditIncomplete = [];\n\n// ── Schema preflight: configured association type IDs must exist ────────────\nconst schemaCheck = { ok: true, verified: true, missing: [] };\nfor (const rel of cfg.relations) {\n  for (const [lvl, typeId, dir] of [[rel.lower, rel.upTypeId, rel.upDirection], [rel.upper, rel.downTypeId, rel.downDirection]]) {\n    const schema = g.schemas ? g.schemas[lvl] : null;\n    if (!schema) { schemaCheck.verified = false; continue; }\n    const found = (schema.associations || []).some((a) => String(a.id) === String(typeId));\n    if (!found) {\n      schemaCheck.ok = false;\n      schemaCheck.missing.push({ level: lvl, direction: dir, typeId });\n      addIssue({ code: 'association_definition_missing', severity: 'critical', level: lvl, recordId: null, recordName: cfg.levels[lvl].label,\n        message: `Association type ID ${typeId} (${dir}) is not defined on ${cfg.levels[lvl].objectType}. Fix the *_TYPE_ID env vars before trusting label checks or repairs.`,\n        remediation: { action: 'manual_review', status: 'manual_review', detail: 'Check GET /crm/v4/associations/{from}/{to}/labels and update the env vars.' } });\n    }\n  }\n}\n\n// ── Relation checks ─────────────────────────────────────────────────────────\nfor (const rel of cfg.relations) {\n  const lowerLbl = cfg.levels[rel.lower].label; const upperLbl = cfg.levels[rel.upper].label;\n  const up = parseDirection(rel.upDirection);\n  const down = parseDirection(rel.downDirection);\n  const lowerCount = byId[rel.lower].size;\n  const upReadable = up.read || lowerCount === 0;\n\n  if (!upReadable) {\n    auditIncomplete.push(rel.upDirection);\n    addIssue({ code: 'audit_incomplete', severity: 'critical', level: rel.lower, recordId: null, recordName: lowerLbl,\n      message: `Could not read ${rel.upDirection} associations; orphan detection for ${lowerLbl} records was skipped.`,\n      remediation: { action: 'manual_review', status: 'blocked', detail: 'Re-run after resolving the fetch error. All mutations are blocked for this run.' } });\n  }\n\n  const edges = new Map();\n  const edge = (lowerId, upperId) => {\n    const k = `${lowerId}|${upperId}`;\n    if (!edges.has(k)) edges.set(k, { lowerId, upperId, up: false, down: false, upTypes: new Set(), downTypes: new Set() });\n    return edges.get(k);\n  };\n  for (const [fromId, list] of up.map) for (const t of list) { const e = edge(fromId, t.toId); e.up = true; t.types.forEach((x) => e.upTypes.add(x)); }\n  for (const [fromId, list] of down.map) for (const t of list) { const e = edge(t.toId, fromId); e.down = true; t.types.forEach((x) => e.downTypes.add(x)); }\n\n  const valid = new Map(); // lowerId -> Set(upperId)\n  const unverifiedLower = new Set(); // lower records whose link target may just be unfetched\n  for (const e of edges.values()) {\n    const lower = byId[rel.lower].get(e.lowerId);\n    const upper = byId[rel.upper].get(e.upperId);\n    if (!lower && !upper) continue;\n    if (!lower || !upper) {\n      const missingLevel = upper ? rel.lower : rel.upper;\n      const existing = lower || upper;\n      const missingId = upper ? e.lowerId : e.upperId;\n      const searchFailed = blockingFetchErrors.some((x) => x.stage === `search_${missingLevel}`);\n      const verified = !fetchMeta.truncated[missingLevel] && !searchFailed;\n      const fromLevel = existing.level; const toLevel = missingLevel;\n      addIssue({ code: 'dangling_association', severity: 'high', level: existing.level, recordId: existing.id, recordName: existing.name,\n        relatedLevel: missingLevel, relatedId: missingId, url: recordUrl(existing.level, existing.id),\n        message: `${existing.name} is associated with ${cfg.levels[missingLevel].label} ${missingId}, which no longer exists (deleted or archived).`,\n        remediation: verified\n          ? { action: 'archive_dangling_association', status: 'planned', detail: `Archive ${fromLevel}→${toLevel} link ${existing.id} → ${missingId}.` }\n          : { action: 'archive_dangling_association', status: 'unverified', detail: `${cfg.levels[missingLevel].label} search was truncated or failed; the target may simply not have been fetched.` } });\n      tagRecord(existing.level, existing.id, 'dangling_association');\n      if (verified) archives.push({ fromLevel, toLevel, fromId: existing.id, toId: missingId });\n      else if (lower) unverifiedLower.add(lower.id);\n      continue;\n    }\n    valid.set(e.lowerId, (valid.get(e.lowerId) || new Set()).add(e.upperId));\n\n    if (cfg.checkBidirectional && up.read && down.read && e.up !== e.down) {\n      addIssue({ code: 'asymmetric_association', severity: 'medium', level: rel.lower, recordId: lower.id, recordName: lower.name,\n        relatedLevel: rel.upper, relatedId: upper.id, url: recordUrl(rel.lower, lower.id),\n        message: `${lower.name} ↔ ${upper.name} appears only in the ${e.up ? rel.upDirection : rel.downDirection} read.`,\n        remediation: { action: 'manual_review', status: 'manual_review', detail: 'Usually index lag; re-run. If it persists, remove and re-create the association in HubSpot.' } });\n      tagRecord(rel.lower, lower.id, 'asymmetric_association');\n    }\n    if (cfg.strictAssociationTypes) {\n      const upBad = e.up && !e.upTypes.has(rel.upTypeId);\n      const downBad = e.down && !e.downTypes.has(rel.downTypeId);\n      if (upBad || downBad) {\n        const seen = [...new Set([...e.upTypes, ...e.downTypes])].join(', ') || 'none';\n        addIssue({ code: 'association_label_mismatch', severity: 'medium', level: rel.lower, recordId: lower.id, recordName: lower.name,\n          relatedLevel: rel.upper, relatedId: upper.id, url: recordUrl(rel.lower, lower.id),\n          message: `${lower.name} → ${upper.name} uses association type ${seen}; expected ${rel.upTypeId} (${rel.upDirection}).`,\n          remediation: { action: 'create_missing_association', status: 'planned', detail: `Add type ${rel.upTypeId} to the existing pair (additive; the old type is left in place).` } });\n        tagRecord(rel.lower, lower.id, 'association_label_mismatch');\n        creates.push({ fromLevel: rel.lower, toLevel: rel.upper, typeId: rel.upTypeId, fromId: lower.id, toId: upper.id, reason: 'add_expected_type' });\n      }\n    }\n  }\n  validUppers[rel.lower] = valid;\n\n  // Orphans + cardinality\n  if (upReadable) {\n    for (const lower of byId[rel.lower].values()) {\n      const ups = valid.get(lower.id) || new Set();\n      if (ups.size === 0 && rel.requireUpper && unverifiedLower.has(lower.id)) continue; // target may exist beyond the truncated search\n      if (ups.size === 0 && rel.requireUpper) {\n        orphanSet[rel.lower].add(lower.id);\n        let remediation;\n        if (!lower.hint) remediation = { action: 'manual_review', status: 'manual_review', detail: `No ${cfg.levels[rel.lower].hintProperty} value; assign a ${upperLbl} manually.` };\n        else {\n          const matches = keyIndex[rel.upper].get(lower.hint.toLowerCase()) || [];\n          if (matches.length === 1) {\n            remediation = { action: 'create_missing_association', status: 'planned', detail: `Re-link to ${matches[0].name} (${cfg.keyProperty} = ${lower.hint}).`, targetId: matches[0].id, targetName: matches[0].name };\n            creates.push({ fromLevel: rel.lower, toLevel: rel.upper, typeId: rel.upTypeId, fromId: lower.id, toId: matches[0].id, reason: 'orphan_hint_match' });\n          } else if (matches.length > 1) {\n            remediation = { action: 'manual_review', status: 'manual_review', detail: `Hint ${lower.hint} matches ${matches.length} ${upperLbl} records; resolve the duplicate key first.` };\n          } else {\n            remediation = { action: 'manual_review', status: 'manual_review', detail: `Hint ${lower.hint} matches no ${upperLbl} record.` };\n          }\n        }\n        addIssue({ code: `orphan_${rel.lower}`, severity: 'high', level: rel.lower, recordId: lower.id, recordName: lower.name, url: recordUrl(rel.lower, lower.id),\n          message: `${lower.name} has no valid ${upperLbl} association.`, remediation });\n        tagRecord(rel.lower, lower.id, `orphan_${rel.lower}`);\n      } else if (ups.size > rel.maxUpperPerLower) {\n        const names = [...ups].map((id) => byId[rel.upper].get(id).name).join(', ');\n        addIssue({ code: 'cardinality_violation', severity: 'medium', level: rel.lower, recordId: lower.id, recordName: lower.name, url: recordUrl(rel.lower, lower.id),\n          message: `${lower.name} is linked to ${ups.size} ${upperLbl} records (max ${rel.maxUpperPerLower}): ${names}.`,\n          remediation: { action: 'manual_review', status: 'manual_review', detail: `Decide which ${upperLbl} is authoritative; the validator never removes valid links automatically.` } });\n        tagRecord(rel.lower, lower.id, 'cardinality_violation');\n      }\n    }\n  }\n\n  // Empty parents (informational, top relation only)\n  if (rel.upper === 'parent' && cfg.flagEmptyParents && upReadable && !fetchMeta.truncated[rel.lower]) {\n    const withChildren = new Set([...valid.values()].flatMap((s) => [...s]));\n    for (const p of byId.parent.values()) {\n      if (withChildren.has(p.id)) continue;\n      addIssue({ code: 'empty_parent', severity: 'low', level: 'parent', recordId: p.id, recordName: p.name, url: recordUrl('parent', p.id),\n        message: `${p.name} has no ${lowerLbl} records.`, remediation: { action: 'manual_review', status: 'informational', detail: 'Confirm whether this parent is still active.' } });\n      tagRecord('parent', p.id, 'empty_parent');\n    }\n  }\n}\n\n// ── Broken chains: assets whose every linked child is itself orphaned ────────\nfor (const [assetId, childIds] of validUppers.asset) {\n  const ids = [...childIds];\n  if (ids.length && ids.every((cid) => orphanSet.child.has(cid))) {\n    const asset = byId.asset.get(assetId);\n    const childNames = ids.map((cid) => byId.child.get(cid).name).join(', ');\n    addIssue({ code: 'broken_chain', severity: 'high', level: 'asset', recordId: asset.id, recordName: asset.name, relatedLevel: 'child', relatedId: ids[0], url: recordUrl('asset', asset.id),\n      message: `${asset.name} cannot reach any ${cfg.levels.parent.label}: ${childNames} has no valid ${cfg.levels.parent.label} link.`,\n      remediation: { action: 'manual_review', status: 'manual_review', detail: `Resolves automatically once ${childNames} is re-parented.` } });\n    tagRecord('asset', asset.id, 'broken_chain');\n  }\n}\n\n// ── Record status + flag plan (only records whose status changes) ───────────\nconst statusFor = (codes) => {\n  if (!codes || codes.size === 0) return 'ok';\n  if ([...codes].some((c) => c.startsWith('orphan_'))) return 'orphaned';\n  if (codes.has('dangling_association')) return 'broken_link';\n  if (codes.has('broken_chain')) return 'broken_chain';\n  return 'needs_review';\n};\nconst flags = [];\nconst healthy = {};\nfor (const lvl of LEVELS) {\n  healthy[lvl] = 0;\n  for (const r of byId[lvl].values()) {\n    const codes = recIssues.get(`${lvl}:${r.id}`);\n    const status = statusFor(codes);\n    if (status === 'ok') healthy[lvl] += 1;\n    const prior = r.priorStatus || 'ok';\n    if (prior === status) continue;\n    flags.push({ level: lvl, id: r.id, name: r.name, from: r.priorStatus, to: status,\n      properties: { integrity_status: status, integrity_issue_codes: codes ? [...codes].sort().join(';') : '', integrity_last_checked: cfg.runDate, integrity_run_id: cfg.runId } });\n  }\n}\n\n// ── Group mutations into HubSpot batch payloads ─────────────────────────────\nconst groupBy = (arr, keyFn) => arr.reduce((m, x) => { const k = keyFn(x); (m[k] = m[k] || []).push(x); return m; }, {});\nconst uniq = (arr, keyFn) => { const s = new Set(); return arr.filter((x) => { const k = keyFn(x); if (s.has(k)) return false; s.add(k); return true; }); };\n\nconst createGroups = Object.values(groupBy(uniq(creates, (c) => `${c.fromLevel}|${c.toLevel}|${c.typeId}|${c.fromId}|${c.toId}`), (c) => `${c.fromLevel}|${c.toLevel}|${c.typeId}`))\n  .map((list) => ({ action: 'create_missing_association', fromLevel: list[0].fromLevel, toLevel: list[0].toLevel,\n    path: `/crm/v4/associations/${cfg.levels[list[0].fromLevel].objectType}/${cfg.levels[list[0].toLevel].objectType}/batch/create`,\n    count: list.length,\n    inputs: list.map((c) => ({ types: [{ associationCategory: cfg.associationCategory, associationTypeId: c.typeId }], from: { id: c.fromId }, to: { id: c.toId } })),\n    labels: list.map((c) => `${byId[c.fromLevel].get(c.fromId).name} → ${byId[c.toLevel].get(c.toId).name}`) }));\n\nconst archiveGroups = Object.values(groupBy(uniq(archives, (a) => `${a.fromLevel}|${a.toLevel}|${a.fromId}|${a.toId}`), (a) => `${a.fromLevel}|${a.toLevel}`))\n  .map((list) => {\n    const byFrom = groupBy(list, (a) => a.fromId);\n    return { action: 'archive_dangling_association', fromLevel: list[0].fromLevel, toLevel: list[0].toLevel,\n      path: `/crm/v4/associations/${cfg.levels[list[0].fromLevel].objectType}/${cfg.levels[list[0].toLevel].objectType}/batch/archive`,\n      count: list.length,\n      inputs: Object.entries(byFrom).map(([fromId, xs]) => ({ from: { id: fromId }, to: xs.map((x) => ({ id: x.toId })) })),\n      labels: list.map((a) => `${byId[a.fromLevel].get(a.fromId).name} → deleted ${a.toId}`) };\n  });\n\nconst flagGroups = Object.values(groupBy(flags, (f) => f.level)).map((list) => ({\n  action: 'flag_records', fromLevel: list[0].level, toLevel: null,\n  path: `/crm/v3/objects/${cfg.levels[list[0].level].objectType}/batch/update`,\n  count: list.length,\n  inputs: list.map((f) => ({ id: f.id, properties: f.properties })),\n  labels: list.map((f) => `${f.name}: ${f.from || 'unset'} → ${f.to}`),\n}));\n\n// ── Stats, severity, mutation guard ─────────────────────────────────────────\nconst totalRecords = LEVELS.reduce((a, l) => a + byId[l].size, 0);\nconst healthyRecords = LEVELS.reduce((a, l) => a + healthy[l], 0);\nconst lowerTotal = byId.child.size + byId.asset.size;\nconst orphanTotal = orphanSet.child.size + orphanSet.asset.size;\nconst orphanRatePct = lowerTotal ? Math.round((orphanTotal / lowerTotal) * 10000) / 100 : 0;\nconst integrityScore = totalRecords ? Math.round((healthyRecords / totalRecords) * 1000) / 10 : 100;\n\nconst byCode = {};\nfor (const i of issues) byCode[i.code] = (byCode[i.code] || 0) + 1;\nlet runSeverity = issues.reduce((s, i) => maxSev(s, i.severity), 'low');\nif (!issues.length) runSeverity = 'none';\nif (orphanTotal > 0 && orphanRatePct >= cfg.orphanRateAlertThresholdPct) runSeverity = 'critical';\n\nconst enabled = new Set(cfg.enabledActions);\nconst allGroups = [...createGroups, ...archiveGroups, ...flagGroups];\nconst enabledGroups = allGroups.filter((gr) => enabled.has(gr.action));\nconst plannedCount = enabledGroups.reduce((a, gr) => a + gr.count, 0);\nconst reasons = [];\nif (blockingFetchErrors.length) reasons.push(`fetch_errors: ${blockingFetchErrors.length} read(s) failed`);\nconst truncatedLevels = Object.keys(fetchMeta.truncated || {}).filter((k) => fetchMeta.truncated[k]);\nif (truncatedLevels.length) reasons.push(`search_truncated: ${truncatedLevels.join(', ')} (raise SEARCH_MAX_PAGES or narrow the audit scope)`);\nif (auditIncomplete.length) reasons.push(`audit_incomplete: ${auditIncomplete.join(', ')}`);\nif (orphanRatePct > cfg.mutationAbortOrphanRatePct) reasons.push(`orphan_rate_abort: ${orphanRatePct}% > ${cfg.mutationAbortOrphanRatePct}% (likely a fetch or configuration problem, not real orphans)`);\nif (plannedCount > cfg.maxMutationsPerRun) reasons.push(`mutation_budget_exceeded: ${plannedCount} planned > MAX_MUTATIONS_PER_RUN ${cfg.maxMutationsPerRun}`);\nconst createBlockedReason = !schemaCheck.ok ? 'association_definition_missing' : (!schemaCheck.verified && g.source === 'live' ? 'schema_unverified' : null);\n\nconst groupsWithStatus = allGroups.map((gr) => {\n  let status = 'planned';\n  if (!enabled.has(gr.action)) status = 'skipped_action_not_enabled';\n  else if (reasons.length) status = 'blocked_by_guard';\n  else if (gr.action === 'create_missing_association' && createBlockedReason) status = `blocked_${createBlockedReason}`;\n  return { ...gr, status };\n});\n\n// Keep issue remediation statuses honest about what will actually happen.\nfor (const i of issues) {\n  if (!i.remediation || !['create_missing_association', 'archive_dangling_association'].includes(i.remediation.action) || i.remediation.status !== 'planned') continue;\n  if (!enabled.has(i.remediation.action)) i.remediation.status = 'not_enabled';\n  else if (reasons.length) i.remediation.status = 'blocked';\n  else if (i.remediation.action === 'create_missing_association' && createBlockedReason) i.remediation.status = 'blocked';\n}\n\nconst SORT = { critical: 0, high: 1, medium: 2, low: 3 };\nissues.sort((a, b) => SORT[a.severity] - SORT[b.severity] || a.code.localeCompare(b.code) || String(a.recordName).localeCompare(String(b.recordName)));\n\nreturn [{\n  json: {\n    runId: cfg.runId,\n    modeLabel: cfg.modeLabel,\n    source: g.source || 'unknown',\n    runSeverity,\n    integrityScore,\n    orphanRatePct,\n    stats: {\n      records: { parent: byId.parent.size, child: byId.child.size, asset: byId.asset.size, total: totalRecords },\n      healthy: { ...healthy, total: healthyRecords },\n      orphans: { child: orphanSet.child.size, asset: orphanSet.asset.size, total: orphanTotal },\n      issuesTotal: issues.length,\n      issuesByCode: byCode,\n      issuesBySeverity: Object.fromEntries(SEVERITIES.map((s) => [s, issues.filter((i) => i.severity === s).length])),\n    },\n    issues,\n    remediationPlan: {\n      groups: groupsWithStatus,\n      totals: {\n        create_missing_association: createGroups.reduce((a, x) => a + x.count, 0),\n        archive_dangling_association: archiveGroups.reduce((a, x) => a + x.count, 0),\n        flag_records: flagGroups.reduce((a, x) => a + x.count, 0),\n      },\n      enabledActions: cfg.enabledActions,\n      plannedEnabledCount: plannedCount,\n    },\n    mutationGuard: { blocked: reasons.length > 0, reasons, createBlockedReason },\n    schemaCheck,\n    fetchMeta,\n  },\n}];\n"
+      },
+      "id": "cba5bb17-ded8-447e-a2a0-eb4a70a55a9b",
+      "name": "Association Integrity & Orphan Detection Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Build Remediation Batches\n// Turns the engine's remediation plan into HubSpot batch requests, in a safe\n// order: 1) create missing associations, 2) archive verified dangling links,\n// 3) flag records (integrity_status). Chunks to MUTATION_BATCH_SIZE (≤ 100).\n// allowWrite is true ONLY when the Config gate is open AND the mutation guard\n// did not block. Always emits ≥ 1 item so the write gate always executes.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst engine = $input.first().json;\nconst size = Math.min(100, Math.max(1, Number(cfg.mutationBatchSize) || 100));\nconst ORDER = { create_missing_association: 0, archive_dangling_association: 1, flag_records: 2 };\n\nconst runnable = engine.remediationPlan.groups\n  .filter((gr) => gr.status === 'planned')\n  .sort((a, b) => ORDER[a.action] - ORDER[b.action]);\n\nconst batches = [];\nfor (const gr of runnable) {\n  for (let i = 0; i < gr.inputs.length; i += size) {\n    const inputs = gr.inputs.slice(i, i + size);\n    batches.push({\n      action: gr.action,\n      fromLevel: gr.fromLevel,\n      toLevel: gr.toLevel,\n      path: gr.path,\n      body: { inputs },\n      count: gr.action === 'archive_dangling_association' ? inputs.reduce((a, x) => a + x.to.length, 0) : inputs.length,\n      labels: gr.labels.slice(i, i + size),\n    });\n  }\n}\n\nconst gateOpen = cfg.allowHubspotMutations === true && !engine.mutationGuard.blocked;\nif (!gateOpen || batches.length === 0) {\n  return [{\n    json: {\n      allowWrite: false,\n      empty: batches.length === 0,\n      blockedReason: !cfg.allowHubspotMutations ? cfg.mutationBlockedReason\n        : engine.mutationGuard.blocked ? 'mutation_guard' : 'nothing_to_change',\n      previewBatches: batches,\n    },\n  }];\n}\n\nreturn batches.map((b, i) => ({\n  json: { allowWrite: true, batchIndex: i, batchCount: batches.length, ...b },\n  pairedItem: { item: 0 },\n}));\n"
+      },
+      "id": "5bd10415-a0e2-428c-af81-665d38dc2ae8",
+      "name": "Build Remediation Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2940,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8a5fe4d0-9b9b-419e-a5ea-c2f5e5a091b7",
+              "leftValue": "={{ $json.allowWrite }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c81d5520-5bda-4c9c-a955-a727f6f93fde",
+      "name": "Gate: Live CRM Mutation Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3160,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.hubapi.com{{ $json.path }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          }
+        }
+      },
+      "id": "01b951e6-9fd3-4965-a001-48a74fcc6fad",
+      "name": "HubSpot: Execute Remediation Batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3380,
+        -20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Association batch audit/log: v4 create + archive, v3 batch/update of integrity_status (crm.objects.custom.write).",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Collect Remediation Results\n// Correlates each HubSpot batch response (in order) with its request.\n// Association archive returns 204 (empty body) on success; create and update\n// return { status, results, numErrors, errors }. Partial failures are\n// reported, never thrown, so the summary and ops alert always run.\n// ─────────────────────────────────────────────────────────────────────────────\nconst requests = $('Build Remediation Batches').all();\nconst responses = $input.all();\nconst byAction = {};\nconst failures = [];\n\nresponses.forEach((r, i) => {\n  const req = requests[i] ? requests[i].json : { action: 'unknown', count: 0, batchIndex: i };\n  const body = r.json || {};\n  const a = byAction[req.action] || (byAction[req.action] = { attempted: 0, succeeded: 0, failed: 0 });\n  a.attempted += req.count;\n  if (body.error) {\n    a.failed += req.count;\n    const msg = typeof body.error === 'string' ? body.error : (body.error.message || 'request failed');\n    failures.push({ batchIndex: req.batchIndex, action: req.action, path: req.path, message: String(msg).slice(0, 300) });\n    return;\n  }\n  const errs = Array.isArray(body.errors) ? body.errors : [];\n  const failed = Math.min(req.count, Number(body.numErrors) || errs.length || 0);\n  a.failed += failed;\n  a.succeeded += req.count - failed;\n  errs.slice(0, 10).forEach((e) => failures.push({ batchIndex: req.batchIndex, action: req.action, path: req.path, message: String(e.message || e.category || 'record error').slice(0, 300) }));\n});\n\nconst totals = Object.values(byAction).reduce((t, a) => ({ attempted: t.attempted + a.attempted, succeeded: t.succeeded + a.succeeded, failed: t.failed + a.failed }), { attempted: 0, succeeded: 0, failed: 0 });\n\nreturn [{ json: { writeMode: 'live', batchesAttempted: responses.length, byAction, ...totals, failures, ok: failures.length === 0 } }];\n"
+      },
+      "id": "07e1e999-88c1-4b15-a3fc-1174f8537b98",
+      "name": "Collect Remediation Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Dry-Run Remediation Preview\n// Reached whenever the mutation gate is closed. Lists exactly which HubSpot\n// batch calls WOULD run, plus planned groups that were skipped or blocked.\n// No network calls.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst engine = $('Association Integrity & Orphan Detection Engine').first().json;\nconst marker = $input.first().json;\nconst batches = marker.previewBatches || [];\n\nreturn [{\n  json: {\n    writeMode: 'preview',\n    blockedReason: marker.blockedReason,\n    guardReasons: engine.mutationGuard.reasons,\n    portalId: cfg.hubspotPortalId,\n    wouldRun: batches.map((b) => ({ action: b.action, method: 'POST', endpoint: `https://api.hubapi.com${b.path}`, records: b.count, examples: b.labels.slice(0, 5) })),\n    wouldChangeCount: batches.reduce((a, b) => a + b.count, 0),\n    notRunnable: engine.remediationPlan.groups.filter((gr) => gr.status !== 'planned').map((gr) => ({ action: gr.action, status: gr.status, records: gr.count })),\n    sampleRequestBody: batches[0] ? { path: batches[0].path, body: { inputs: batches[0].body.inputs.slice(0, 2) } } : null,\n    attempted: 0,\n    succeeded: 0,\n    failed: 0,\n    failures: [],\n    ok: true,\n  },\n}];\n"
+      },
+      "id": "1085bd7e-d139-40c1-a41e-16058116a910",
+      "name": "Dry-Run Remediation Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3480,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// RevOps Slack Block Kit Alert Builder\n// Summarises integrity score, orphan counts, broken links and the remediation\n// plan, with deep links to each affected HubSpot record. ≤ 50 blocks, section\n// text ≤ 3000 chars. Always built (for preview); sent only when allowed.\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst engine = $('Association Integrity & Orphan Detection Engine').first().json;\nlet write = null;\ntry { write = $('Collect Remediation Results').first().json; } catch (e) { /* not executed */ }\nif (!write) { try { write = $('Dry-Run Remediation Preview').first().json; } catch (e) { /* not executed */ } }\n\nconst SEV = ['low', 'medium', 'high', 'critical'];\nconst ICON = { critical: ':red_circle:', high: ':large_orange_circle:', medium: ':large_yellow_circle:', low: ':white_circle:', none: ':large_green_circle:' };\nconst TITLES = {\n  audit_incomplete: 'Audit incomplete',\n  association_definition_missing: 'Association definition missing',\n  orphan_child: `Orphaned ${cfg.levels.child.label} records`,\n  orphan_asset: `Orphaned ${cfg.levels.asset.label} records`,\n  dangling_association: 'Dangling associations (deleted targets)',\n  broken_chain: `Broken chains (${cfg.levels.asset.label} → no ${cfg.levels.parent.label})`,\n  cardinality_violation: 'Cardinality violations',\n  association_label_mismatch: 'Association type/label mismatches',\n  asymmetric_association: 'Asymmetric associations',\n  empty_parent: `${cfg.levels.parent.label} records with no ${cfg.levels.child.label}`,\n};\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);\nconst minRank = SEV.indexOf(cfg.alertMinSeverity);\nconst alertIssues = engine.issues.filter((i) => SEV.indexOf(i.severity) >= minRank);\nconst shouldAlert = alertIssues.length > 0 || engine.runSeverity === 'critical';\n\nconst s = engine.stats;\nconst mode = cfg.modeLabel === 'LIVE' ? ':satellite_antenna: LIVE' : cfg.modeLabel === 'SANDBOX' ? ':test_tube: SANDBOX (synthetic data)' : ':eyes: LIVE DRY RUN';\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: clip(`HubSpot association integrity · ${cfg.runDate}`, 150), emoji: true } },\n  { type: 'context', elements: [{ type: 'mrkdwn', text: clip(`${mode}  ·  Run \\`${esc(cfg.runId)}\\`  ·  ${ICON[engine.runSeverity] || ''} ${String(engine.runSeverity).toUpperCase()}`, 3000) }] },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: `*Integrity score*\\n${engine.integrityScore}% healthy` },\n    { type: 'mrkdwn', text: `*Records audited*\\n${s.records.parent} ${esc(cfg.levels.parent.label)} · ${s.records.child} ${esc(cfg.levels.child.label)} · ${s.records.asset} ${esc(cfg.levels.asset.label)}` },\n    { type: 'mrkdwn', text: `*Orphaned*\\n${s.orphans.child} ${esc(cfg.levels.child.label)} · ${s.orphans.asset} ${esc(cfg.levels.asset.label)} (${engine.orphanRatePct}%)` },\n    { type: 'mrkdwn', text: `*Broken links*\\n${s.issuesByCode.dangling_association || 0} dangling · ${s.issuesByCode.broken_chain || 0} broken chain` },\n  ] },\n  { type: 'divider' },\n];\n\nconst grouped = {};\nfor (const i of alertIssues) (grouped[i.code] = grouped[i.code] || []).push(i);\nconst codes = Object.keys(grouped).sort((a, b) => SEV.indexOf(grouped[b][0].severity) - SEV.indexOf(grouped[a][0].severity));\nfor (const code of codes.slice(0, 10)) {\n  const list = grouped[code];\n  const lines = list.slice(0, 5).map((i) => {\n    const who = i.url ? `<${i.url}|${esc(i.recordName)}>` : `*${esc(i.recordName)}*`;\n    const fix = i.remediation ? ` _→ ${esc(i.remediation.action.replace(/_/g, ' '))} (${esc(i.remediation.status)})_` : '';\n    return `• ${who}: ${esc(i.message)}${fix}`;\n  });\n  if (list.length > 5) lines.push(`_…and ${list.length - 5} more in the n8n execution log._`);\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`${ICON[list[0].severity]} *${esc(TITLES[code] || code)}* (${list.length})\\n${lines.join('\\n')}`, 3000) } });\n}\n\nconst t = engine.remediationPlan.totals;\nlet remediationLine;\nif (!write) remediationLine = 'Remediation: not evaluated';\nelse if (write.writeMode === 'live') remediationLine = `Remediation applied: ${write.succeeded}/${write.attempted} change(s) succeeded${write.failures.length ? `, ${write.failures.length} failure(s)` : ''}.`;\nelse remediationLine = `Remediation preview only (${esc(write.blockedReason)}): ${write.wouldChangeCount} change(s) would run.`;\nblocks.push({ type: 'divider' });\nblocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`*Remediation plan*  ·  ${t.create_missing_association} re-link · ${t.archive_dangling_association} archive dangling · ${t.flag_records} record flag(s)\\n${remediationLine}${engine.mutationGuard.blocked ? `\\n:octagonal_sign: Mutation guard: ${esc(engine.mutationGuard.reasons.join('; '))}` : ''}`, 3000) } });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Enabled actions: ${esc(cfg.enabledActions.join(', ') || 'none')}  ·  Portal ${esc(cfg.hubspotPortalId)}  ·  Records list: filter *integrity_status ≠ ok* in HubSpot` }] });\n\nconst safeBlocks = blocks.slice(0, 50);\nconst fallback = clip(`[${cfg.modeLabel}] HubSpot association integrity ${engine.runSeverity}: ${s.orphans.total} orphaned, ${s.issuesByCode.dangling_association || 0} dangling, score ${engine.integrityScore}%.`, 3000);\n\nlet skipReason = null;\nif (!shouldAlert) skipReason = 'no_alert_worthy_issues';\nelse if (!cfg.sendSlackAlerts) skipReason = 'send_slack_alerts_disabled';\nelse if (cfg.dryRun) skipReason = 'dry_run';\nelse if (!cfg.secretsPresent.hasSlackWebhook) skipReason = 'missing_slack_webhook';\nconst allowSend = cfg.allowSlackSend === true && shouldAlert;\n\nreturn [{ json: { allowSend, skipReason: allowSend ? null : skipReason, alertIssueCount: alertIssues.length, blockCount: safeBlocks.length, payload: { text: fallback, blocks: safeBlocks, unfurl_links: false, unfurl_media: false } } }];\n"
+      },
+      "id": "943bd9c1-01f2-4901-af2a-21b3d8e797a2",
+      "name": "RevOps Slack Block Kit Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "de13219a-94f0-4783-ad66-c037f37d04fd",
+              "leftValue": "={{ $json.allowSend }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cb6144a7-2656-40f1-a082-6af68a47a0bf",
+      "name": "Gate: Slack Send Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4060,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_ALERT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "28b0a52a-efab-425e-a491-eec988d3e4e0",
+      "name": "Slack: Post RevOps Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4280,
+        -20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Incoming webhook. Only when SEND_SLACK_ALERTS=true and DRY_RUN=false.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Slack Alert Skipped\n// Records why no Slack message was sent (gate closed or nothing alert-worthy).\n// ─────────────────────────────────────────────────────────────────────────────\nconst b = $input.first().json;\nreturn [{ json: { slackStatus: 'skipped', skipReason: b.skipReason || 'gate_closed', alertIssueCount: b.alertIssueCount, blockCount: b.blockCount } }];\n"
+      },
+      "id": "a8f5596d-af29-43ac-ac3f-7992d4148d02",
+      "name": "Slack Alert Skipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4280,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────────────\n// Execution Summary & Audit\n// One secret-free audit record per run: effective safety gates, record and\n// issue counts, integrity score, remediation outcome, Slack outcome,\n// warnings/errors and a deterministic checksum. Decides whether the ops\n// alert should fire (only if the SEND_OPS_ALERTS gate is open).\n// ─────────────────────────────────────────────────────────────────────────────\nconst cfg = $('Config & Safety Gate').first().json;\nconst engine = $('Association Integrity & Orphan Detection Engine').first().json;\nconst slackBuild = $('RevOps Slack Block Kit Builder').first().json;\nlet write = null;\ntry { write = $('Collect Remediation Results').first().json; } catch (e) { /* not executed */ }\nif (!write) { try { write = $('Dry-Run Remediation Preview').first().json; } catch (e) { /* not executed */ } }\n\nconst last = $input.first().json || {};\nlet slack;\nif (last.slackStatus === 'skipped') slack = { status: 'skipped', reason: last.skipReason };\nelse if (last.error) slack = { status: 'failed', reason: String(typeof last.error === 'string' ? last.error : (last.error.message || 'request failed')).slice(0, 300) };\nelse slack = { status: String(last.data ?? '').trim() === 'ok' ? 'sent' : 'sent_unconfirmed', blocks: slackBuild.blockCount };\n\nconst warnings = [...(cfg.warnings || [])];\nconst errors = [];\nfor (const e of engine.fetchMeta.errors || []) (e.nonBlocking ? warnings : errors).push(e.nonBlocking ? `${e.stage}: ${e.message}` : { stage: e.stage, message: e.message });\nfor (const lvl of Object.keys(engine.fetchMeta.truncated || {})) if (engine.fetchMeta.truncated[lvl]) warnings.push(`${lvl} search was truncated; dangling verdicts for that level are unverified.`);\nif (engine.mutationGuard.blocked) warnings.push(`Mutation guard blocked remediation: ${engine.mutationGuard.reasons.join('; ')}`);\nfor (const i of engine.issues.filter((x) => x.code === 'audit_incomplete' || x.code === 'association_definition_missing')) errors.push({ stage: 'engine', code: i.code, message: i.message });\nif (write && write.failures && write.failures.length) write.failures.forEach((f) => errors.push({ stage: 'hubspot_remediation', action: f.action, message: f.message }));\nif (slack.status === 'failed') errors.push({ stage: 'slack', message: slack.reason });\n\nconst status = errors.length ? 'completed_with_errors' : warnings.length ? 'completed_with_warnings' : 'success';\nconst finishedAt = new Date();\nconst fnv = (str) => { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16).padStart(8, '0'); };\nconst issueIds = engine.issues.map((i) => i.id).sort();\n\nconst audit = {\n  runId: cfg.runId,\n  workflow: 'n8n-hubspot-custom-object-multi-level-association-validator',\n  status,\n  mode: cfg.modeLabel,\n  source: engine.source,\n  startedAt: cfg.runStartedAt,\n  finishedAt: finishedAt.toISOString(),\n  durationMs: Math.max(0, finishedAt - new Date(cfg.runStartedAt)),\n  safety: {\n    sandboxRequested: cfg.sandboxRequested, sandboxMode: cfg.sandboxMode, dryRun: cfg.dryRun,\n    hubspotMutationsEnabled: cfg.hubspotMutationsEnabled, sendSlackAlerts: cfg.sendSlackAlerts, sendOpsAlerts: cfg.sendOpsAlerts,\n    gates: { allowHubspotMutations: cfg.allowHubspotMutations, allowSlackSend: cfg.allowSlackSend, allowOpsAlert: cfg.allowOpsAlert },\n    mutationGuard: engine.mutationGuard,\n    enabledActions: cfg.enabledActions,\n    envAccessible: cfg.envAccessible,\n    secretsPresent: cfg.secretsPresent,\n  },\n  hierarchy: Object.fromEntries(Object.entries(cfg.levels).map(([k, l]) => [k, l.objectType])),\n  runSeverity: engine.runSeverity,\n  integrityScore: engine.integrityScore,\n  orphanRatePct: engine.orphanRatePct,\n  stats: engine.stats,\n  schemaCheck: engine.schemaCheck,\n  remediation: write ? {\n    mode: write.writeMode,\n    blockedReason: write.blockedReason || null,\n    planned: engine.remediationPlan.totals,\n    wouldChange: write.wouldChangeCount ?? null,\n    attempted: write.attempted, succeeded: write.succeeded, failed: write.failed,\n  } : null,\n  slack,\n  issueIds,\n  warnings,\n  errors,\n  checksum: `fnv1a-${fnv(JSON.stringify({ runId: cfg.runId, issueIds, stats: engine.stats }))}`,\n};\n\nconst needsOpsAlert = cfg.allowOpsAlert === true && (errors.length > 0 || engine.mutationGuard.blocked);\n\nreturn [{\n  json: {\n    ...audit,\n    needsOpsAlert,\n    opsAlertPayload: needsOpsAlert ? {\n      text: `[${cfg.modeLabel}] HubSpot association validator ${status} (${cfg.runId}): ${errors.length} error(s), ${warnings.length} warning(s).`,\n      runId: cfg.runId, status, errors: errors.slice(0, 20), warnings: warnings.slice(0, 20),\n    } : null,\n  },\n}];\n"
+      },
+      "id": "552294f5-ff1d-44f1-aee3-c86079a07df9",
+      "name": "Execution Summary & Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4520,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "445dedc4-400c-4507-a9e7-29a6837f6cf7",
+              "leftValue": "={{ $json.needsOpsAlert }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "80109eff-2d52-47e6-aa84-670fe971e0c4",
+      "name": "Gate: Ops Alert Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4740,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.opsAlertPayload) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 250
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "f2c16f0d-3018-457e-ad72-782fc736244f",
+      "name": "Ops: Post Failure Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4960,
+        20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Only when SEND_OPS_ALERTS=true, DRY_RUN=false and errors or a guard block occurred.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Weekly Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Route: Sandbox or Live?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: Sandbox or Live?": {
+      "main": [
+        [
+          {
+            "node": "Load Sandbox Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Live Fetch Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sandbox Fixture": {
+      "main": [
+        [
+          {
+            "node": "Association Integrity & Orphan Detection Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Live Fetch Plan": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Read Schema Definitions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Read Schema Definitions": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Parent Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Parent Records": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Child Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Child Records": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Asset Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Asset Records": {
+      "main": [
+        [
+          {
+            "node": "Build Association Read Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Association Read Batches": {
+      "main": [
+        [
+          {
+            "node": "Gate: Any Association Reads?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate: Any Association Reads?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Read Associations (v4)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble Live Association Graph",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Read Associations (v4)": {
+      "main": [
+        [
+          {
+            "node": "Assemble Live Association Graph",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Live Association Graph": {
+      "main": [
+        [
+          {
+            "node": "Association Integrity & Orphan Detection Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Association Integrity & Orphan Detection Engine": {
+      "main": [
+        [
+          {
+            "node": "Build Remediation Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Remediation Batches": {
+      "main": [
+        [
+          {
+            "node": "Gate: Live CRM Mutation Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate: Live CRM Mutation Allowed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Execute Remediation Batch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run Remediation Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Execute Remediation Batch": {
+      "main": [
+        [
+          {
+            "node": "Collect Remediation Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Remediation Results": {
+      "main": [
+        [
+          {
+            "node": "RevOps Slack Block Kit Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Remediation Preview": {
+      "main": [
+        [
+          {
+            "node": "RevOps Slack Block Kit Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RevOps Slack Block Kit Builder": {
+      "main": [
+        [
+          {
+            "node": "Gate: Slack Send Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate: Slack Send Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Slack: Post RevOps Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Alert Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Post RevOps Alert": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Alert Skipped": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary & Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execution Summary & Audit": {
+      "main": [
+        [
+          {
+            "node": "Gate: Ops Alert Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate: Ops Alert Needed?": {
+      "main": [
+        [
+          {
+            "node": "Ops: Post Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
