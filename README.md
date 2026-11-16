@@ -64,6 +64,8 @@ n8n-hubspot-custom-object-multi-level-association-validator/
 
 ## Architecture overview
 
+![Workflow Overview](./workflow-overview.png)
+
 ```mermaid
 flowchart LR
     subgraph Triggers
