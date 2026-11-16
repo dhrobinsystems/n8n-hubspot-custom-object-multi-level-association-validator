@@ -1,0 +1,694 @@
+{
+  "_meta": {
+    "description": "SYNTHETIC sandbox fixture for n8n-hubspot-custom-object-multi-level-association-validator. Every record, ID, portal, object type and association type is fictional. Record shapes mirror HubSpot CRM v3 search results; association shapes mirror CRM v4 batch/read results.",
+    "schemaVersion": "association-hierarchy-graph/v1",
+    "hubspotPortalId": "99000001",
+    "expectedFindings": {
+      "orphan_child": [
+        "ChildProject C (repairable via parent_external_id PAR-002)",
+        "ChildProject D (no hint, manual review)",
+        "ChildProject G (hint PAR-404 matches no parent)",
+        "ChildProject H (only link points to deleted parent)"
+      ],
+      "orphan_asset": [
+        "AssetUnit Z (repairable via child_external_id CHD-001)",
+        "AssetUnit W (only link points to deleted child)"
+      ],
+      "dangling_association": [
+        "ChildProject H → deleted parent 9100999",
+        "ParentHoldings Ltd → deleted child 9200998",
+        "AssetUnit W → deleted child 9200999"
+      ],
+      "multiple_parents": [
+        "ChildProject E (ParentCorp Inc + ParentHoldings Ltd)"
+      ],
+      "association_label_mismatch": [
+        "ChildProject F → ParentHoldings Ltd uses typeId 999 instead of 901"
+      ],
+      "broken_chain": [
+        "AssetUnit V (its child ChildProject D has no parent)"
+      ],
+      "asymmetric_association": [
+        "AssetUnit U ↔ ChildProject B present only in the asset → child read"
+      ],
+      "empty_parent": [
+        "EmptyShell Group has no children"
+      ],
+      "stale_flag_cleared": [
+        "AssetUnit T was flagged orphaned last run and is now healthy"
+      ]
+    }
+  },
+  "graph": {
+    "source": "sandbox",
+    "levels": {
+      "parent": {
+        "objectType": "p99000001_parent_account",
+        "objectTypeId": "2-99000101",
+        "label": "Parent"
+      },
+      "child": {
+        "objectType": "p99000001_child_project",
+        "objectTypeId": "2-99000102",
+        "label": "Child"
+      },
+      "asset": {
+        "objectType": "p99000001_asset_unit",
+        "objectTypeId": "2-99000103",
+        "label": "Asset"
+      }
+    },
+    "schemas": {
+      "parent": {
+        "objectTypeId": "2-99000101",
+        "fullyQualifiedName": "p99000001_parent_account",
+        "associations": [
+          {
+            "id": "902",
+            "fromObjectTypeId": "2-99000101",
+            "toObjectTypeId": "2-99000102",
+            "name": "parent_account_to_child_project"
+          }
+        ]
+      },
+      "child": {
+        "objectTypeId": "2-99000102",
+        "fullyQualifiedName": "p99000001_child_project",
+        "associations": [
+          {
+            "id": "901",
+            "fromObjectTypeId": "2-99000102",
+            "toObjectTypeId": "2-99000101",
+            "name": "child_project_to_parent_account"
+          },
+          {
+            "id": "904",
+            "fromObjectTypeId": "2-99000102",
+            "toObjectTypeId": "2-99000103",
+            "name": "child_project_to_asset_unit"
+          }
+        ]
+      },
+      "asset": {
+        "objectTypeId": "2-99000103",
+        "fullyQualifiedName": "p99000001_asset_unit",
+        "associations": [
+          {
+            "id": "903",
+            "fromObjectTypeId": "2-99000103",
+            "toObjectTypeId": "2-99000102",
+            "name": "asset_unit_to_child_project"
+          }
+        ]
+      }
+    },
+    "records": {
+      "parent": [
+        {
+          "id": "9100001",
+          "properties": {
+            "hs_object_id": "9100001",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ParentCorp Inc",
+            "external_id": "PAR-001",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9100002",
+          "properties": {
+            "hs_object_id": "9100002",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ParentHoldings Ltd",
+            "external_id": "PAR-002",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9100003",
+          "properties": {
+            "hs_object_id": "9100003",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "EmptyShell Group",
+            "external_id": "PAR-003",
+            "integrity_status": null
+          },
+          "archived": false
+        }
+      ],
+      "child": [
+        {
+          "id": "9200001",
+          "properties": {
+            "hs_object_id": "9200001",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject A",
+            "external_id": "CHD-001",
+            "parent_external_id": "PAR-001",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9200002",
+          "properties": {
+            "hs_object_id": "9200002",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject B",
+            "external_id": "CHD-002",
+            "parent_external_id": "PAR-001",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9200003",
+          "properties": {
+            "hs_object_id": "9200003",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject C",
+            "external_id": "CHD-003",
+            "parent_external_id": "PAR-002",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9200004",
+          "properties": {
+            "hs_object_id": "9200004",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject D",
+            "external_id": "CHD-004",
+            "parent_external_id": null,
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9200005",
+          "properties": {
+            "hs_object_id": "9200005",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject E",
+            "external_id": "CHD-005",
+            "parent_external_id": "PAR-001",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9200006",
+          "properties": {
+            "hs_object_id": "9200006",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject F",
+            "external_id": "CHD-006",
+            "parent_external_id": "PAR-002",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9200007",
+          "properties": {
+            "hs_object_id": "9200007",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject G",
+            "external_id": "CHD-007",
+            "parent_external_id": "PAR-404",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9200008",
+          "properties": {
+            "hs_object_id": "9200008",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "ChildProject H",
+            "external_id": "CHD-008",
+            "parent_external_id": null,
+            "integrity_status": "ok"
+          },
+          "archived": false
+        }
+      ],
+      "asset": [
+        {
+          "id": "9300001",
+          "properties": {
+            "hs_object_id": "9300001",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit X",
+            "external_id": "AST-001",
+            "child_external_id": "CHD-001",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9300002",
+          "properties": {
+            "hs_object_id": "9300002",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit Y",
+            "external_id": "AST-002",
+            "child_external_id": "CHD-002",
+            "integrity_status": "ok"
+          },
+          "archived": false
+        },
+        {
+          "id": "9300003",
+          "properties": {
+            "hs_object_id": "9300003",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit Z",
+            "external_id": "AST-003",
+            "child_external_id": "CHD-001",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9300004",
+          "properties": {
+            "hs_object_id": "9300004",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit W",
+            "external_id": "AST-004",
+            "child_external_id": null,
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9300005",
+          "properties": {
+            "hs_object_id": "9300005",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit V",
+            "external_id": "AST-005",
+            "child_external_id": "CHD-004",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9300006",
+          "properties": {
+            "hs_object_id": "9300006",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit U",
+            "external_id": "AST-006",
+            "child_external_id": "CHD-002",
+            "integrity_status": null
+          },
+          "archived": false
+        },
+        {
+          "id": "9300007",
+          "properties": {
+            "hs_object_id": "9300007",
+            "hs_lastmodifieddate": "2026-11-14T10:00:00.000Z",
+            "name": "AssetUnit T",
+            "external_id": "AST-007",
+            "child_external_id": "CHD-001",
+            "integrity_status": "orphaned"
+          },
+          "archived": false
+        }
+      ]
+    },
+    "associations": {
+      "child_to_parent": {
+        "status": "COMPLETE",
+        "results": [
+          {
+            "from": {
+              "id": "9200001"
+            },
+            "to": [
+              {
+                "toObjectId": 9100001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 901,
+                    "label": "Child of parent"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200002"
+            },
+            "to": [
+              {
+                "toObjectId": 9100001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 901,
+                    "label": "Child of parent"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200005"
+            },
+            "to": [
+              {
+                "toObjectId": 9100001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 901,
+                    "label": "Child of parent"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9100002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 901,
+                    "label": "Child of parent"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200006"
+            },
+            "to": [
+              {
+                "toObjectId": 9100002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 999,
+                    "label": null
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200008"
+            },
+            "to": [
+              {
+                "toObjectId": 9100999,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 901,
+                    "label": "Child of parent"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "parent_to_child": {
+        "status": "COMPLETE",
+        "results": [
+          {
+            "from": {
+              "id": "9100001"
+            },
+            "to": [
+              {
+                "toObjectId": 9200001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9200002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9200005,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9100002"
+            },
+            "to": [
+              {
+                "toObjectId": 9200005,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9200006,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9200998,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 902,
+                    "label": "Parent of child"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "asset_to_child": {
+        "status": "COMPLETE",
+        "results": [
+          {
+            "from": {
+              "id": "9300001"
+            },
+            "to": [
+              {
+                "toObjectId": 9200001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9300002"
+            },
+            "to": [
+              {
+                "toObjectId": 9200002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9300004"
+            },
+            "to": [
+              {
+                "toObjectId": 9200999,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9300005"
+            },
+            "to": [
+              {
+                "toObjectId": 9200004,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9300006"
+            },
+            "to": [
+              {
+                "toObjectId": 9200002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9300007"
+            },
+            "to": [
+              {
+                "toObjectId": 9200001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 903,
+                    "label": "Asset of child"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "child_to_asset": {
+        "status": "COMPLETE",
+        "results": [
+          {
+            "from": {
+              "id": "9200001"
+            },
+            "to": [
+              {
+                "toObjectId": 9300001,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 904,
+                    "label": "Child of asset"
+                  }
+                ]
+              },
+              {
+                "toObjectId": 9300007,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 904,
+                    "label": "Child of asset"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200002"
+            },
+            "to": [
+              {
+                "toObjectId": 9300002,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 904,
+                    "label": "Child of asset"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "from": {
+              "id": "9200004"
+            },
+            "to": [
+              {
+                "toObjectId": 9300005,
+                "associationTypes": [
+                  {
+                    "category": "USER_DEFINED",
+                    "typeId": 904,
+                    "label": "Child of asset"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "fetchMeta": {
+      "truncated": {
+        "parent": false,
+        "child": false,
+        "asset": false
+      },
+      "pages": {
+        "parent": 1,
+        "child": 1,
+        "asset": 1
+      },
+      "errors": []
+    }
+  }
+}
